@@ -62,7 +62,12 @@ jobs:
             --output "dist/${GOOS}_${GOARCH}/caddy" \
             "${WITH_ARGS[@]}"
 
-          dist/${GOOS}_${GOARCH}/caddy version
+          # Only execute on runner-native arch
+          if [[ "${GOARCH}" == "amd64" ]]; then
+            dist/${GOOS}_${GOARCH}/caddy version
+            dist/${GOOS}_${GOARCH}/caddy list-modules | head -n 200
+          fi
+
           (cd dist/${GOOS}_${GOARCH} && sha256sum caddy > caddy.sha256)
 
       - name: Upload binary artifacts
@@ -95,12 +100,12 @@ jobs:
         run: |
           set -euo pipefail
           echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
-      
+
           IMAGES="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
           if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
             IMAGES="${IMAGES}\n${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
           fi
-      
+
           echo "images<<EOF" >> "$GITHUB_OUTPUT"
           echo -e "$IMAGES" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
