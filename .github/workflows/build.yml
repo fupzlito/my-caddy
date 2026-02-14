@@ -1,0 +1,261 @@
+name: caddy-custom
+
+on:
+  push:
+    branches:
+      - "**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  IMAGE_NAME: caddy-custom
+
+jobs:
+  build-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install xcaddy
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Build Caddy with modules
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/${GOOS}_${GOARCH}"
+
+          WITH_ARGS=()
+          while IFS= read -r line; do
+            line="${line%%#*}"
+            line="$(echo -n "$line" | xargs || true)"
+            [[ -z "$line" ]] && continue
+            WITH_ARGS+=( "--with" "$line" )
+          done < caddy-modules.txt
+
+          VERSION_ARGS=()
+          if [[ -f caddy-version.txt ]]; then
+            ver="$(tr -d ' \t\r\n' < caddy-version.txt || true)"
+            if [[ -n "$ver" && "$ver" != "latest" ]]; then
+              VERSION_ARGS+=( "--version" "$ver" )
+            fi
+          fi
+
+          xcaddy build \
+            "${VERSION_ARGS[@]}" \
+            --output "dist/${GOOS}_${GOARCH}/caddy" \
+            "${WITH_ARGS[@]}"
+
+          dist/${GOOS}_${GOARCH}/caddy version
+          (cd dist/${GOOS}_${GOARCH} && sha256sum caddy > caddy.sha256)
+
+      - name: Upload binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux_${{ matrix.arch }}
+          path: dist/linux_${{ matrix.arch }}/
+
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download binaries into dist/
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Compute date + image list
+        id: vars
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "ymd=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+          IMAGES="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${IMAGE_NAME}"
+          if [[ -n "${DOCKERHUB_USERNAME:-}" && -n "${DOCKERHUB_TOKEN:-}" ]]; then
+            IMAGES="${IMAGES}\n${DOCKERHUB_USERNAME}/${IMAGE_NAME}"
+          fi
+
+          echo "images<<EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$IMAGES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub (optional)
+        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Container metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.vars.outputs.images }}
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            type=raw,value=latest.${{ steps.vars.outputs.ymd }},enable=${{ github.ref_name == 'main' }}
+            type=raw,value=${{ github.ref_name }},enable=${{ github.ref_name != 'main' }}
+            type=raw,value=${{ github.ref_name }}.${{ steps.vars.outputs.ymd }},enable=${{ github.ref_name != 'main' }}
+
+      - name: Build & push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  release-binaries:
+    runs-on: ubuntu-latest
+    needs: build-binaries
+    # runs for all branches; adjust if you want fewer releases
+    if: ${{ github.ref_type == 'branch' }}
+    steps:
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-dist
+
+      - name: Prepare release files + detect version
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          cp release-dist/linux_amd64/caddy out/caddy-linux-amd64
+          cp release-dist/linux_amd64/caddy.sha256 out/caddy-linux-amd64.sha256
+          cp release-dist/linux_arm64/caddy out/caddy-linux-arm64
+          cp release-dist/linux_arm64/caddy.sha256 out/caddy-linux-arm64.sha256
+
+          VER="$(out/caddy-linux-amd64 version | awk '{print $1}')"
+          echo "caddy_ver=$VER" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF_NAME}" == "main" ]]; then
+            echo "channel_tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "channel_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Force-move tags to this commit (channel + version)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.sha;
+
+            const channelTag = "${{ steps.prep.outputs.channel_tag }}";
+            const verTag = "caddy-${{ steps.prep.outputs.caddy_ver }}";
+
+            async function upsertTag(tag) {
+              try {
+                await github.rest.git.updateRef({
+                  owner, repo,
+                  ref: `tags/${tag}`,
+                  sha,
+                  force: true
+                });
+              } catch (e) {
+                await github.rest.git.createRef({
+                  owner, repo,
+                  ref: `refs/tags/${tag}`,
+                  sha
+                });
+              }
+            }
+
+            await upsertTag(channelTag);
+            await upsertTag(verTag);
+
+      - name: Delete existing assets in release (channel tag)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = "${{ steps.prep.outputs.channel_tag }}";
+
+            let rel;
+            try {
+              rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            } catch (e) {
+              return;
+            }
+
+            for (const a of rel.data.assets) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: a.id });
+            }
+
+      - name: Delete existing assets in release (version tag)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag = "caddy-${{ steps.prep.outputs.caddy_ver }}";
+
+            let rel;
+            try {
+              rel = await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+            } catch (e) {
+              return;
+            }
+
+            for (const a of rel.data.assets) {
+              await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: a.id });
+            }
+
+      - name: Create/Update release (channel tag) + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.prep.outputs.channel_tag }}
+          name: ${{ steps.prep.outputs.channel_tag }}
+          prerelease: true
+          files: out/*
+
+      - name: Create/Update release (version tag) + upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: caddy-${{ steps.prep.outputs.caddy_ver }}
+          name: caddy-${{ steps.prep.outputs.caddy_ver }}
+          prerelease: true
+          files: out/*
