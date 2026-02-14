@@ -176,6 +176,8 @@ jobs:
           cp release-dist/linux_arm64/caddy out/caddy-linux-arm64
           cp release-dist/linux_arm64/caddy.sha256 out/caddy-linux-arm64.sha256
 
+          chmod +x out/caddy-linux-amd64 out/caddy-linux-arm64
+
           VER="$(out/caddy-linux-amd64 version | awk '{print $1}')"
           echo "caddy_ver=$VER" >> "$GITHUB_OUTPUT"
 
