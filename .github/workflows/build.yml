@@ -62,6 +62,8 @@ jobs:
             --output "dist/${GOOS}_${GOARCH}/caddy" \
             "${WITH_ARGS[@]}"
 
+          chmod +x "dist/${GOOS}_${GOARCH}/caddy"
+
           # Only execute on runner-native arch
           if [[ "${GOARCH}" == "amd64" ]]; then
             dist/${GOOS}_${GOARCH}/caddy version
